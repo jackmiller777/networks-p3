@@ -1,0 +1,508 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+
+BITMASK_ARRAY = [ '0',   # = /0
+                 '128',  # = /1
+                 '192',  # = /2
+                 '224',  # = /3
+                 '240',  # = /4
+                 '248',  # = /5
+                 '252',  # = /6
+                 '254',  # = /7
+                 '255' ] # = /8
+
+# convert part of an ip (str) to its length in bits
+def bitlength(x):
+    if x == '0':
+        return 0
+    else:
+        return len(bin(int(x)))-2
+    
+def decrement_mask(mask):
+    mask = mask.split('.')
+    for i in range(4):
+        if i < 3 and int(mask[i+1]) == 0:
+            mask[i] = decrement_helper(mask[i])
+            break
+        elif i == 3:
+            mask[i] = decrement_helper(mask[i])
+    return '.'.join(mask)
+
+def decrement_helper(mask_octet):
+    for i in range(len(BITMASK_ARRAY)):
+        if  BITMASK_ARRAY[i] < mask_octet:
+            continue
+        else:
+            return BITMASK_ARRAY[i-1]
+            
+# Forwarding table class, glorified list of entry dicts
+# has additional helper functions
+class Table:
+    
+    tbl = []
+    
+    def __init__(self, announcements=None, revocations=None):
+        # if announcements not None, build tbl from inputs
+        if announcements != None:
+            
+            # new empty table
+            self.tbl = []
+            
+            # add announcements
+            for entry in announcements:
+                new_entry = entry['msg']
+                new_entry['peer'] = entry['src']
+                self.append(new_entry)
+               
+            # remove revocations
+            for entry in revocations:
+                self.withdraw(entry['msg'])
+            
+            prev_len = len(self.tbl)   
+            self.aggregate()
+            curr_len = len(self.tbl)
+            while (curr_len != prev_len):
+                prev_len = curr_len   
+                self.aggregate()
+                curr_len = len(self.tbl)
+                
+        # else do nothing
+        else:
+            pass
+    
+    # prints table (for debugging)
+    def print_tbl(self):
+        for entry in self.tbl:
+            print(entry)
+    
+    # return table as string
+    def __str__(self):
+        return str(self.tbl)
+    
+    # return table
+    def get_tbl(self):
+        return self.tbl
+    
+    # returns true if table contains entry
+    def contains(self, search):
+        for entry in self.tbl:
+            if entry['network'] == search['network'] and entry['netmask'] == search['netmask']:
+                return True
+            
+        return False
+    
+    # update routing tbl and aggregate
+    def update(self, entry):
+        self.append(entry)
+        self.aggregate()
+    
+    # append routing entry dict to tbl
+    def append(self, entry):
+        self.tbl.append(entry)
+        
+    # remove dead entries from table
+    def withdraw(self, withdraw_list):
+    
+        # go through withdraw_list and remove from tbl
+        for to_remove in withdraw_list:
+            network = to_remove['network']
+            netmask = to_remove['netmask']
+            for entry in self.tbl:
+                if entry['network'] == network and entry['netmask'] == netmask:
+                    self.tbl.remove(entry)
+                    return
+
+    # return list of possible routes for selecting fwding address given dst
+    def possible_routes(self, dst):
+        possible_routes = []
+        max_mask = '0'
+        #loop through entries
+        for entry in self.tbl:
+            network = entry['network']
+            netmask = entry['netmask']
+            
+            # if masked network doesnt match dst mask, skip
+            if self.mask(network, netmask) != self.mask(dst, netmask):
+                continue
+            # if new netmask is longer, start new list
+            elif netmask > max_mask:
+                possible_routes = [entry,]
+                max_mask = netmask
+            # if same length mask, add entry
+            elif netmask == max_mask:
+                possible_routes.append(entry)
+                
+        return possible_routes
+    
+    # performs five tests to ultimately pick the best fwding address
+    # works according to assignment requirements
+    def tiebreaker(self, routes):
+        
+        # find routes with highest localpref
+        max_lp = -1
+        possible_routes = []
+        for route in routes:
+            lp = route['localpref']
+            if lp > max_lp:
+                possible_routes = [route,]
+                max_lp = lp
+            elif lp == max_lp:
+                possible_routes.append(route)
+        if len(possible_routes) == 1:
+            return possible_routes[0]['peer']
+        
+        routes = possible_routes.copy()
+        
+        # if multiple options, find routes with true selfOrigin
+        possible_routes = []
+        anyTrue = False
+        for route in routes:
+            if route['selfOrigin']:
+                anyTrue = True
+                possible_routes.append(route)
+        if len(possible_routes) == 1:
+            return possible_routes[0]['peer']
+        if anyTrue:
+            routes = possible_routes.copy()
+            
+        # if mult options, select shortest path routes
+        min_as = len(routes[0]['ASPath'])
+        possible_routes = []
+        for route in routes:
+            l_as = len(route['ASPath'])
+            if l_as < min_as:
+                possible_routes = [route,]
+                min_as = l_as
+            elif l_as == min_as:
+                possible_routes.append(route)
+        if len(possible_routes) == 1:
+            return possible_routes[0]['peer']
+        
+        routes = possible_routes.copy() 
+        
+        # if mult options, select best origin routes
+        max_o = 'UNK'
+        possible_routes = []
+        for route in routes:
+            o = route['origin']
+            if o == 'IGP':
+                if max_o != 'IGP':
+                    possible_routes = [route,]
+                    max_o = 'IGP'
+                else:
+                    possible_routes.append(route)
+            elif o == 'EGP':
+                if max_o == 'UNK':
+                    possible_routes = [route,]
+                    max_o = 'EGP'
+                elif max_o == 'EGP':
+                    possible_routes.append(route)
+            elif o == 'UNK':
+                if max_o == 'UNK':
+                    possible_routes.append(route)
+        if len(possible_routes) == 1:
+            return possible_routes[0]['peer']
+        
+        routes = possible_routes.copy() 
+        
+        # if mult options, select lowest address
+        min_addr = routes[0]['peer']
+        for route in routes:
+            if route['peer'] < min_addr:
+                min_addr = route['peer']
+        
+        return min_addr
+        
+        
+    # finds best route to forward data to
+    def best_route(self, dst):
+        
+        # get possible routes with best netmask match
+        possible_routes = self.possible_routes(dst)
+        
+        # return None if no routes found
+        if len(possible_routes) == 0:
+            fwding_address = None
+        # return if only one option
+        elif len(possible_routes) == 1:
+            fwding_address = possible_routes[0]['peer']
+        # select best route if multiple in list
+        else:                
+            # get peer address from tiebreaker
+            fwding_address = self.tiebreaker(possible_routes)
+        return fwding_address
+    
+    # performs mask operation by converting to binary and using bitwise 'and'
+    def mask(self, network, netmask):
+        network = network.split('.')
+        netmask = netmask.split('.')
+        bnet = []
+        bmask = []
+        bmasked = []
+        masked = []
+        for i in range(4):
+            # convert to binary
+            bnet.append(bin(int(network[i])))
+            bmask.append(bin(int(netmask[i])))
+
+            # bitwise 'and'
+            bmasked.append(int(bnet[i],2) & int(bmask[i],2))
+            # convert back to decimal int string
+            masked.append(str(int(bmasked[i])))
+
+        # rejoin as string
+        return '.'.join(masked)
+    
+    # aggregate entries if possible, combining numerically
+    # adjacent pairs and adding new entry with lesser mask
+    def aggregate(self):
+        to_withdraw = []
+        to_add = []
+        
+        # compare all entries against eachother without repeats (i and j row/col)
+        for i in range(len(self.tbl) - 1):
+            entry1 = self.tbl[i]
+            for j in range(len(self.tbl)):
+                if i < j:
+                    entry2 = self.tbl[j]
+                    # compare two entries for adjacency and equal attributes
+                    if self.adjacent(entry1, entry2) and self.equal_attributes(entry1, entry2):
+                        
+                        # aggregate two entries into one
+                        
+                        # old entries to be removed
+                        to_withdraw.append(entry1)
+                        to_withdraw.append(entry2)
+                    
+                        # build new entry
+                        if entry1['network'] < entry2['network']:
+                            entry = entry1.copy()
+                        else:
+                            entry = entry2.copy()
+                        entry['netmask'] = decrement_mask(entry['netmask'])
+                        
+                        # new entry to be added
+                        to_add.append(entry)
+                        
+#                        print('AGGREGATED',entry1['network'],entry2['network'])
+        
+        # remove old entries
+        for entry in to_withdraw:
+            self.withdraw([entry,])
+            
+        # add new entries
+        for entry in to_add:
+            self.append(entry)
+            
+    # return true if entries are adjacent
+    def adjacent(self, entry1, entry2):
+        # not adjacent if netmasks not equal
+        if entry1['netmask'] != entry2['netmask']:
+            return False
+        
+        # get masked addresses
+        addr1 = self.mask(entry1['network'],entry1['netmask'])
+        addr2 = self.mask(entry2['network'],entry2['netmask'])
+        mask = entry1['netmask'].split('.')
+        addr1 = addr1.split('.')
+        addr2 = addr2.split('.')
+        
+        # xor lowest bits to check for adjacency
+        for i in range(4):
+            if addr1[i] == addr2[i]:
+                continue
+            md = BITMASK_ARRAY.index(mask[i]) - 1
+            format_string = '{:08b}'
+            bn1 = format_string.format(int(addr1[i]))
+            bn2 = format_string.format(int(addr2[i]))
+            if int(bn1[md],2) ^ int(bn2[md],2) and bn1[:md] == bn2[:md]:
+                return True
+    
+    # return true if both entries have the same values
+    # for each comparator
+    def equal_attributes(self, entry1, entry2):
+        comparators = ['origin',
+                       'localpref',
+                       'ASPath',
+                       'selfOrigin',
+                       'peer']
+        return all(map(lambda x: entry1[x] == entry2[x],comparators))
+            
+        
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+
+    # Additional data not from starter code
+    tbl = Table() # forwarding table
+    neighbors = [] # list of router neighbors
+    announcements = [] # list of announcements
+    revocations = [] # list of revocations
+    
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+            self.neighbors.append(neighbor)
+
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+                
+                print("Received message '%s' from %s" % (msg, srcif))
+                
+                # load msg to dict
+                packet = json.loads(msg)
+                p_type = packet['type']
+                # process packets by type
+                if p_type == 'update':
+                    self.update(packet)
+                elif p_type == 'withdraw':
+                    self.withdraw(packet)
+                elif p_type == 'data':
+                    self.data(packet, srcif)
+                elif p_type == 'dump':
+                    self.dump(packet)
+                
+#        print(self.tbl.get_tbl())
+        return
+    
+    # respond to 'update' type packets
+    def update(self, packet):
+        
+        # add msg to announcements
+        self.announcements.append(packet)
+        
+        # add entry to forwarding table
+        entry = packet['msg']
+        entry['peer'] = packet['src']
+        self.tbl.update(entry)
+        
+        # build subset msg to be forwarded
+        fwd_msg = {}
+        fwd_msg['netmask'] = packet['msg']['netmask']
+        # add asn to ASPath
+        aspath = [self.asn,]
+        aspath.extend(packet['msg']['ASPath'])
+        fwd_msg['ASPath'] = aspath
+        fwd_msg['network'] = packet['msg']['network']
+        
+        # forward packet if necessary
+        relationship = self.relations[packet['src']]
+        
+        # select neighbors to forward to based on relationship
+        if relationship == 'cust':
+            forwarding_list = self.neighbors
+        else:
+            forwarding_list = self.customers()
+            
+        # forward update
+        for neighbor in forwarding_list:
+            if neighbor != packet['src']:
+                self.send(neighbor, json.dumps({ 'msg': fwd_msg, 'src': self.our_addr(neighbor), 'dst': neighbor, 'type': 'update' }))
+        
+        
+    # respond to 'withdraw' type packets
+    def withdraw(self, packet):
+        
+        # add msg to revocations
+        self.revocations.append(packet)
+        
+        # remove dead entry from fwding tbl
+        # automatically removes new withdraw
+        # and reaggregates
+            
+        self.tbl = Table(self.announcements, self.revocations)
+        
+        # for debugging
+#        self.tbl.print_tbl()
+#        for entry in self.announcements:
+#            print(entry)
+#        for entry in self.revocations:
+#            print(entry)
+        
+        # forward packet if necessary
+        relationship = self.relations[packet['src']]
+        
+        # select neighbors to forward to based on relationship
+        if relationship == 'cust':
+            forwarding_list = self.neighbors
+        else:
+            forwarding_list = self.customers()
+            
+        # forward withdraw
+        for neighbor in forwarding_list:
+            if neighbor != packet['src']:
+                self.send(neighbor, json.dumps({ 'msg': packet['msg'], 'src': self.our_addr(neighbor), 'dst': neighbor, 'type': 'withdraw' }))
+         
+    # checks if the data packet is legal/profitable
+    def legal(self, src, dest):
+        # if src or dest is a customer, send packet
+        if self.relations[src] == 'cust' or self.relations[dest] == 'cust':
+            return True 
+        
+    # forward 'data' type packets
+    def data(self, packet, srcif):
+        fwding_address = self.tbl.best_route(packet['dst'])
+        
+        # check if legal forward:
+        if not self.legal(srcif, fwding_address):
+            fwding_address = None
+        
+        if fwding_address == None:
+            self.send(srcif, json.dumps({ 'msg': {}, 'src': self.our_addr(srcif), 'dst': packet['src'], 'type': 'no route' }))
+        else:
+            self.send(fwding_address, json.dumps(packet))
+        
+    # return current table to source
+    def dump(self, packet):
+        # send current table
+        neighbor = packet['src']
+        self.send(neighbor, json.dumps({ 'msg': self.tbl.get_tbl(), 'src': self.our_addr(neighbor), 'dst': neighbor, 'type': 'table' }))
+    
+    # get list of customers from router neighbors
+    def customers(self):
+        custs = []
+        for neighbor in self.neighbors:
+            if self.relations[neighbor] == 'cust':
+                custs.append(neighbor)
+        return custs
+
+    
+if __name__ == "__main__":
+    if '--debug' not in sys.argv:
+        parser = argparse.ArgumentParser(description='route packets')
+        parser.add_argument('asn', type=int, help="AS number of this router")
+        parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+        args = parser.parse_args()
+        router = Router(args.asn, args.connections)
+        router.run()    
+
+    else:
+        tbl = Table()
+        
