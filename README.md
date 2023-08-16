@@ -2,7 +2,7 @@ miller.john
 README.md
 3700 Proj 3
 
-In this file, you should briefly describe your high-level approach, any challenges you faced, and an overview of how you tested your code.
+Simulated Router
 
 High-level approach:
 My code is made up of the starter code, which contains the Router class, as well as the Table class I wrote. I added to the Router class to perform base router funtions like dumping the table and forwarding, and most things dealing with the routing table were done in the Table class. This included storing the table, aggregating the table, adding/withdrawing, and finding the best forwarding address for a packet. My approach to this project was to read and fully understand the assignment and specifically all aspects of the router. I know for certain that had I not read and understood everything first this assignment would have taken much longer. Instead, I went one by one implementing things in the order of the tests. 
